@@ -18,8 +18,9 @@ not the initial contract.
 
 ## Streaming integration
 
-`plan_cells`/`collect_cells` key on single cells with one commit per frame
-and generation-guarded stale discard. Chunks get a parallel key space
+`plan_cells`/`collect_cells` key on single cells with generation-guarded
+stale discard and a default of one commit per frame
+(`max_cell_commits_per_frame`, tunable in `EngineConfig`). Chunks get a parallel key space
 `(world, tier, anchor)` sharing the same commit budget and epoch handling,
 so fast travel cannot strand half-loaded chunks. Unload uses hysteresis:
 drop a tier only when the camera leaves tier range plus a margin ring, so

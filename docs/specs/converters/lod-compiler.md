@@ -46,11 +46,13 @@ means omit-with-reason, never silent near-match substitution (RULE-05).
 
 ## Outputs
 
-Chunk payload format is decided by ADR (GLB files vs `lod`-table blobs;
-the `lod` table exists but has no writers or readers). Either way, each
-chunk ships conservative bounds, a material batch list, subcell visibility
-data for handoff (GEOM-05), and a manifest entry: content hashes of
-inputs, rule set, settings, and compiler version (BUILD-01/02).
+Chunk payloads are GLB files with the database holding a spatial index,
+per ADR-0010: chunk key `(world, tier, anchor)`, bounds, batch list,
+content hashes, and manifest references, plus an R-tree over world bounds
+for range queries. Each chunk ships conservative bounds, a material batch
+list, subcell visibility data for handoff (GEOM-05), and a manifest entry:
+content hashes of inputs, rule set, settings, and compiler version
+(BUILD-01/02). The `lod` reshape ships with a world DB version bump.
 
 ## Incremental builds
 

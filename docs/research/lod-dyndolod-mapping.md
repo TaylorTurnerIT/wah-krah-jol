@@ -44,7 +44,8 @@ content library is Defer; early phases reuse converted full assets.
 ## Static compilation (GEOM)
 
 Fixed 4/8/16 tiers first; per-worldspace LOD origins are new DB columns
-(`worldspaces` holds only id/editor/parent/flags today). Subcell handoff
+(`worldspaces` holds only id/editor/parent/flags today, with parentage from
+`WNAM`; only the LOD origins are missing, not the parent link). Subcell handoff
 must be designed against single-cell streaming keys. See
 `docs/specs/converters/lod-compiler.md`.
 
