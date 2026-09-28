@@ -1,18 +1,23 @@
 # LOD chunk compiler
 
 Offline compiler turning `references` + `statics` + cell cache into
-spatial LOD chunks. Follows converter norms: canonical paths, staged
-outputs, atomic publish, content-hash invalidation, schema-versioned
-manifests, fail-closed validation with file/block/shape in every error.
+spatial LOD chunks. Uses canonical paths, an immutable input boundary,
+staged outputs, a validated build identity, content-hash invalidation, and
+schema-versioned manifests. Publication while the engine is running is not
+supported in v1; failure preserves the last-good output. Validation errors
+identify file, block, and shape.
 
 ## Inputs
 
 - `references` (placement, rotation, scale, `radius_override`), `statics`
   (model path, bounds), exterior R-tree, cell cache terrain.
 - Per-worldspace LOD origins (new `worldspaces` columns; required by
-  GEOM-02, missing today).
-- Enable-state columns (new; `XESP` parent + inversion flags), extracted
-  at convert time so the runtime never parses blobs per query.
+  GEOM-02, missing today): use a valid `lodsettings/<worldspace>.lod`
+  sidecar or an explicit origin for a custom world. Otherwise skip that
+  world's LOD with an actionable error; never assume an origin of zero.
+- Reference header flags and enable-state columns (new; `XESP` parent +
+  inversion flags), extracted at convert time so eligibility and runtime
+  queries do not depend on per-query blob parsing.
 - Rule set: explicit record rule, then component/type default, then
   omit-with-reason. Every decision records winner, rule, model, and
   fallback reason (ARCH-02, RULE-03).
@@ -21,17 +26,26 @@ manifests, fail-closed validation with file/block/shape in every error.
 
 Per-tier source choice: a landmark may reuse its full GLB at tier 4 while
 clutter drops out before tier 16 (GEOM-03). Authored `_lod` NIF variants
-match by convention where present; `BSLODTriShape`/`BSSubIndexTriShape`
-blocks parse today but flatten on export, so per-level preservation must
-be verified in the vendor crate before they can feed tiers. Missing source
-means omit-with-reason, never silent near-match substitution (RULE-05).
+match by convention where present. The vendor parser reads
+`BSLODTriShape.lod_sizes` and `BSSubIndexTriShape` segment data, but the
+current exporter passes only each block's base `BSTriShape` to the generic
+mesh path. Those per-level counts and segment ranges are lost. Preserve and
+validate them before using these blocks as tier-specific sources. Missing
+source means omit-with-reason, never silent near-match substitution (RULE-05).
+The first static pass admits only verified, unconditionally enabled fixed
+`STAT` references. `statics` is a model catalog, not an eligibility flag;
+unknown, initially disabled, XESP-controlled, movable, animated, and
+unresolved large-reference cases are omitted with reasons until a validated
+individual proxy or handoff route exists.
 
 ## Chunk build
 
 - Transform in double precision, then emit chunk-local coordinates;
   transform normals and winding with the shape transform (GEOM-04).
-- Partition batches by rendering compatibility (material family,
-  alpha mode, overlay identity), not by texture filename (MAT-02).
+- Emit a stable node per source cell in each GLB chunk, with independently
+  hideable terrain and object groups. Partition batches beneath each group by
+  rendering compatibility (material family, alpha mode, overlay identity),
+  not by texture filename (MAT-02).
 - UVs outside 0-1 fall back to direct textures; never clamp repeating
   UVs without a preserving conversion (MAT-04).
 - Strip collision and scene-graph extras from static output; animation
@@ -50,9 +64,11 @@ Chunk payloads are GLB files with the database holding a spatial index,
 per ADR-0010: chunk key `(world, tier, anchor)`, bounds, batch list,
 content hashes, and manifest references, plus an R-tree over world bounds
 for range queries. Each chunk ships conservative bounds, a material batch
-list, subcell visibility data for handoff (GEOM-05), and a manifest entry:
+list, source-cell/group node identity for handoff (GEOM-05), and a manifest entry:
 content hashes of inputs, rule set, settings, and compiler version
-(BUILD-01/02). The `lod` reshape ships with a world DB version bump.
+(BUILD-01/02). DB, manifest, and chunk records share one build identity;
+publish only after every referenced payload validates. The `lod` reshape
+ships with a world DB version bump.
 
 ## Incremental builds
 
