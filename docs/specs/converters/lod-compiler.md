@@ -3,8 +3,10 @@
 Offline compiler turning `references` + `statics` + cell cache into
 spatial LOD chunks. Uses canonical paths, an immutable input boundary,
 staged outputs, a validated build identity, content-hash invalidation, and
-schema-versioned manifests. Publication while the engine is running is not
-supported in v1; failure preserves the last-good output. Validation errors
+schema-versioned manifests. The runtime holds a shared sibling lock while it
+reads an asset directory; publication takes a nonblocking exclusive lock for
+the final swap and refuses to proceed while a reader is active. An interrupted
+swap restores the last-good backup before the next build. Validation errors
 identify file, block, and shape.
 
 ## Inputs
@@ -69,6 +71,11 @@ content hashes of inputs, rule set, settings, and compiler version
 (BUILD-01/02). DB, manifest, and chunk records share one build identity;
 publish only after every referenced payload validates. The `lod` reshape
 ships with a world DB version bump.
+
+GLB vertex and accessor bounds are chunk-local, relative to the chunk root.
+Database bounds and R-tree XY bounds are world-space Creation units: translate
+the chunk-local X/Y extent by `(origin + anchor * tier_side_cells) * 4096`; Z
+is unchanged. Never index chunk-local coordinates as world-space bounds.
 
 ## Incremental builds
 

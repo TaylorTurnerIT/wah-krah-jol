@@ -144,7 +144,8 @@ fn to_launcher_event(event: ProgressEvent) -> ConversionProgressEvent {
         ProgressStage::Textures => 0.50,
         ProgressStage::Meshes => 0.70,
         ProgressStage::Scripts => 0.85,
-        ProgressStage::Validating => 0.93,
+        ProgressStage::LodChunks => 0.90,
+        ProgressStage::Validating => 0.94,
         ProgressStage::Publishing => 0.97,
         ProgressStage::Complete => 1.0,
     };
@@ -153,8 +154,9 @@ fn to_launcher_event(event: ProgressEvent) -> ConversionProgressEvent {
         ProgressStage::Database => 0.20,
         ProgressStage::Textures => 0.20,
         ProgressStage::Meshes => 0.15,
-        ProgressStage::Scripts => 0.08,
-        ProgressStage::Validating => 0.04,
+        ProgressStage::Scripts => 0.05,
+        ProgressStage::LodChunks => 0.04,
+        ProgressStage::Validating => 0.03,
         ProgressStage::Publishing => 0.03,
         _ => 0.0,
     };

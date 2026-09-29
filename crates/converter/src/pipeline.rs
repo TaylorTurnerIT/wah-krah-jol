@@ -3,11 +3,21 @@ use crate::{
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{
         CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, StagedOutput, StagingJournal,
-        configuration_hash, configuration_hash_for_schema, hash_file, load_staged_outputs,
+        configuration_hash, configuration_hash_for_schema, hash_bytes, hash_file,
+        load_staged_outputs,
     },
     config::PipelineConfig,
-    esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database, read_plugins_txt},
+    esm::{
+        EsmParser,
+        cell_cache::write_cell_cache,
+        exporter::validate_database,
+        lodsettings::{LodSettings, sidecar_path},
+        read_plugins_txt,
+    },
     integration::{IntegrationReport, finalize_world_database},
+    lod::terrain::{
+        compile_world_terrain, exterior_terrain_cells, publish_chunks, read_cached_heights,
+    },
     mesh::MeshConverter,
     progress::{ProgressEvent, ProgressStage},
     script::ScriptConverter,
@@ -19,6 +29,7 @@ use color_eyre::{
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use shared::{asset_lock::AssetLock, lod::LodOrigin};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -48,6 +59,12 @@ pub struct PipelineReport {
     /// separately from `skipped` and `warnings`: nothing failed to convert, so a
     /// prune never makes the run incomplete.
     pub pruned_texture_references: u64,
+    /// Terrain LOD chunks compiled this run. Zero when no worldspace had a
+    /// valid origin; a world without one is recorded as an LOD omission, never
+    /// given an assumed origin (GEOM-02).
+    pub lod_chunks: u64,
+    #[serde(default)]
+    pub lod_warnings: Vec<String>,
     pub warnings: Vec<String>,
     pub artifacts: Vec<PathBuf>,
     pub inputs_by_kind: BTreeMap<String, u64>,
@@ -72,6 +89,7 @@ impl AssetPipeline {
         progress_tx: Sender<ProgressEvent>,
     ) -> Result<PipelineReport> {
         config.validate()?;
+        recover_published_output_if_missing(&config.output_dir)?;
         let started = Instant::now();
         send(
             &progress_tx,
@@ -90,7 +108,7 @@ impl AssetPipeline {
         let expected_configuration = configuration_hash(&config)?;
         let configuration_is_compatible = loaded_manifest.configuration_hash
             == expected_configuration
-            || (matches!(loaded_manifest.schema_version, 12..=14)
+            || (matches!(loaded_manifest.schema_version, 12..=15)
                 && loaded_manifest.configuration_hash
                     == configuration_hash_for_schema(&config, loaded_manifest.schema_version)?);
         let previous_manifest = if configuration_is_compatible {
@@ -213,6 +231,10 @@ impl AssetPipeline {
         };
         let files = discover(&config.data_dir)?;
         let plugins = plugin_paths(config, &files)?;
+        let plugin_hashes = plugins
+            .iter()
+            .map(|plugin| hash_file(plugin))
+            .collect::<Result<Vec<_>>>()?;
         let archives: Vec<_> = files
             .iter()
             .filter(|path| extension(path, &["bsa", "ba2"]))
@@ -438,6 +460,15 @@ impl AssetPipeline {
                 .convert_kind(&vfs_files, "pex", ProgressStage::Scripts, None)
                 .await?;
         }
+        compile_lod_chunks(
+            config,
+            staging,
+            &plugins,
+            &plugin_hashes,
+            progress_tx,
+            &mut report,
+        )
+        .await?;
         if let Some(integration) = finalize_world_database(staging)? {
             if !integration.passed {
                 report.warnings.push(format!(
@@ -1271,7 +1302,276 @@ fn staged_output(entry: &CacheEntry, configuration_hash: &str) -> StagedOutput {
     }
 }
 
+/// Compiles Phase 1 terrain LOD chunks for every worldspace with a valid
+/// origin, after the world database and cell cache exist and before
+/// integration validation reads them.
+///
+/// Settings resolution per worldspace: an explicit `lod_origins` entry wins
+/// (custom worlds), otherwise the `lodsettings/<WorldspaceEDID>.lod` sidecar
+/// supplies both origin and extent (installed worlds). Missing or invalid
+/// settings omit only that world's LOD; full-detail conversion remains usable.
+///
+/// The build identity is one hash over the ordered plugin bytes, every
+/// compiled chunk's content hash, the configuration hash, and the converter
+/// schema (BUILD-01/02). It is written to `lod_build` and to the published
+/// manifest; the runtime refuses chunks whose manifest identity differs.
+async fn compile_lod_chunks(
+    config: &PipelineConfig,
+    staging: &Path,
+    plugins: &[PathBuf],
+    plugin_hashes: &[String],
+    progress_tx: &Sender<ProgressEvent>,
+    report: &mut PipelineReport,
+) -> Result<()> {
+    let db_path = staging.join("skyrim_world.db");
+    if plugins.is_empty() || !db_path.is_file() {
+        return Ok(());
+    }
+    let connection = Connection::open(&db_path)?;
+    let mut worlds: Vec<(u32, String)> = connection
+        .prepare("SELECT id, editor_id FROM worldspaces ORDER BY id")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    // Deterministic order regardless of rowid layout.
+    worlds.sort();
+    send(
+        progress_tx,
+        ProgressStage::LodChunks,
+        0,
+        worlds.len() as u64,
+        None,
+        "Compiling terrain LOD chunks",
+    )
+    .await;
+    let mut chunk_hashes: Vec<String> = Vec::new();
+    let mut world_settings = Vec::with_capacity(worlds.len());
+    let mut compiled_worlds = 0u64;
+    for (index, (worldspace_id, editor_id)) in worlds.iter().enumerate() {
+        let settings = match resolve_lod_settings(config, editor_id) {
+            Ok(Some(settings)) => settings,
+            Ok(None) => {
+                let message = format!(
+                    "worldspace {editor_id} ({worldspace_id:08X}) has no LOD origin: no lod_origins entry and no lodsettings/{editor_id}.lod; its terrain LOD is skipped"
+                );
+                report.lod_warnings.push(message);
+                world_settings.push(serde_json::json!({
+                    "worldspace_id": worldspace_id,
+                    "editor_id": editor_id,
+                    "status": "missing",
+                }));
+                send(
+                    progress_tx,
+                    ProgressStage::LodChunks,
+                    (index + 1) as u64,
+                    worlds.len() as u64,
+                    None,
+                    "Compiling terrain LOD chunks",
+                )
+                .await;
+                continue;
+            }
+            Err(error) => {
+                report.lod_warnings.push(format!(
+                    "worldspace {editor_id} ({worldspace_id:08X}) has invalid LOD settings: {error:#}; its terrain LOD is skipped"
+                ));
+                world_settings.push(serde_json::json!({
+                    "worldspace_id": worldspace_id,
+                    "editor_id": editor_id,
+                    "status": "invalid",
+                }));
+                send(
+                    progress_tx,
+                    ProgressStage::LodChunks,
+                    (index + 1) as u64,
+                    worlds.len() as u64,
+                    None,
+                    "Compiling terrain LOD chunks",
+                )
+                .await;
+                continue;
+            }
+        };
+        let origin = settings.origin;
+        world_settings.push(serde_json::json!({
+            "worldspace_id": worldspace_id,
+            "editor_id": editor_id,
+            "status": "ready",
+            "origin": [origin.grid_x, origin.grid_y],
+            "extent": settings.extent.map(|(width, height)| [width, height]),
+        }));
+        connection.execute(
+            "UPDATE worldspaces SET lod_origin_x = ?1, lod_origin_y = ?2 WHERE id = ?3",
+            rusqlite::params![origin.grid_x, origin.grid_y, worldspace_id],
+        )?;
+        let all_cells = exterior_terrain_cells(&connection, *worldspace_id)?;
+        let cells: Vec<_> = all_cells
+            .into_iter()
+            .filter(|(grid_x, grid_y, _)| settings.includes_cell(*grid_x, *grid_y))
+            .collect();
+        if cells.is_empty() {
+            if settings.extent.is_some() {
+                report.lod_warnings.push(format!(
+                    "worldspace {editor_id} ({worldspace_id:08X}) has no terrain cells inside its LOD settings extent"
+                ));
+            }
+            send(
+                progress_tx,
+                ProgressStage::LodChunks,
+                (index + 1) as u64,
+                worlds.len() as u64,
+                None,
+                "Compiling terrain LOD chunks",
+            )
+            .await;
+            continue;
+        }
+        let lookup: std::collections::HashMap<u32, (i32, i32)> = cells
+            .iter()
+            .map(|(grid_x, grid_y, cell_id)| (*cell_id, (*grid_x, *grid_y)))
+            .collect();
+        let inputs = read_cached_heights(&staging.join("cell_cache.rkyv"), &lookup)?;
+        let chunks = compile_world_terrain(*worldspace_id, origin, &inputs)?;
+        for chunk in &chunks {
+            chunk_hashes.push(format!(
+                "{}:{}",
+                shared::lod::chunk_payload_path(chunk.key),
+                hash_bytes(&chunk.glb)
+            ));
+        }
+        // Payloads and their index rows now; the single `lod_build` row
+        // after every world is compiled, once the identity is final.
+        publish_chunks(&connection, staging, None, &chunks)?;
+        report.lod_chunks += chunks.len() as u64;
+        report.artifacts.extend(
+            chunks
+                .iter()
+                .map(|chunk| PathBuf::from(shared::lod::chunk_payload_path(chunk.key))),
+        );
+        compiled_worlds += 1;
+        send(
+            progress_tx,
+            ProgressStage::LodChunks,
+            (index + 1) as u64,
+            worlds.len() as u64,
+            None,
+            "Compiling terrain LOD chunks",
+        )
+        .await;
+    }
+    chunk_hashes.sort();
+    let current_plugin_hashes = plugins
+        .iter()
+        .map(|plugin| hash_file(plugin))
+        .collect::<Result<Vec<_>>>()?;
+    color_eyre::eyre::ensure!(
+        current_plugin_hashes == plugin_hashes,
+        "plugin inputs changed during conversion; refusing to publish an LOD build from a mixed input generation"
+    );
+    let identity = build_identity(
+        plugin_hashes,
+        &chunk_hashes,
+        &configuration_hash(config)?,
+        &world_settings,
+    )?;
+    connection.execute(
+        "INSERT OR REPLACE INTO lod_build(id, build_identity) VALUES (1, ?1)",
+        rusqlite::params![identity],
+    )?;
+    if compiled_worlds > 0 {
+        report.artifacts.push(PathBuf::from("lod-manifest.json"));
+        let manifest = LodManifest {
+            build_identity: identity,
+            converter_schema: CONVERTER_SCHEMA_VERSION,
+            world_database_schema: shared::WORLD_DATABASE_SCHEMA_VERSION,
+            chunks: report.lod_chunks,
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        fs::write(staging.join("lod-manifest.json"), &bytes)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedLodSettings {
+    origin: LodOrigin,
+    extent: Option<(i32, i32)>,
+}
+
+impl ResolvedLodSettings {
+    fn includes_cell(self, grid_x: i32, grid_y: i32) -> bool {
+        let Some((width, height)) = self.extent else {
+            return true;
+        };
+        let dx = i64::from(grid_x) - i64::from(self.origin.grid_x);
+        let dy = i64::from(grid_y) - i64::from(self.origin.grid_y);
+        dx >= 0 && dx < i64::from(width) && dy >= 0 && dy < i64::from(height)
+    }
+}
+
+/// One world's LOD origin and optional sidecar extent. Explicit custom-world
+/// origins have no extent; installed sidecars bound the compiled area.
+fn resolve_lod_settings(
+    config: &PipelineConfig,
+    editor_id: &str,
+) -> Result<Option<ResolvedLodSettings>> {
+    if let Some([x, y]) = config.lod_origins.get(editor_id) {
+        return Ok(Some(ResolvedLodSettings {
+            origin: LodOrigin::new(*x, *y),
+            extent: None,
+        }));
+    }
+    let path = sidecar_path(&config.data_dir, editor_id)?;
+    match fs::metadata(&path) {
+        Ok(_) => {
+            let settings = LodSettings::read(&path)?;
+            Ok(Some(ResolvedLodSettings {
+                origin: settings.origin,
+                extent: Some((settings.width, settings.height)),
+            }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .wrap_err_with(|| format!("failed to inspect LOD settings {}", path.display())),
+    }
+}
+
+/// One build identity across ordered plugin bytes, compiled chunk payloads,
+/// configuration, and converter schema (BUILD-01/02).
+fn build_identity(
+    plugin_hashes: &[String],
+    chunk_hashes: &[String],
+    configuration_hash: &str,
+    world_settings: &[serde_json::Value],
+) -> Result<String> {
+    let canonical = serde_json::json!({
+        "converter_schema": CONVERTER_SCHEMA_VERSION,
+        "world_database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "configuration": configuration_hash,
+        "plugins": plugin_hashes,
+        "chunks": chunk_hashes,
+        "world_settings": world_settings,
+    });
+    Ok(hash_bytes(&serde_json::to_vec(&canonical)?))
+}
+
+/// The published `lod-manifest.json`: the identity the runtime checks before
+/// trusting any chunk row or payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LodManifest {
+    build_identity: String,
+    converter_schema: u32,
+    world_database_schema: u32,
+    chunks: u64,
+}
+
 fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
+    let _asset_lock = AssetLock::acquire_exclusive(output).wrap_err_with(|| {
+        format!(
+            "failed to lock asset directory {} for publication",
+            output.display()
+        )
+    })?;
+    recover_interrupted_publication(output)?;
     let backup = output.with_extension(format!("backup-{}", std::process::id()));
     if backup.exists() {
         bail!("refusing to overwrite stale backup {}", backup.display());
@@ -1280,13 +1580,88 @@ fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
         fs::rename(output, &backup).wrap_err("failed to preserve previous asset output")?;
     }
     if let Err(error) = fs::rename(staging, output) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, output);
+        if backup.exists()
+            && let Err(restore_error) = fs::rename(&backup, output)
+        {
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "failed to publish converted assets and failed to restore last-good output from {}: {restore_error}",
+                    backup.display()
+                )
+            });
         }
         return Err(error).wrap_err("failed to publish converted assets");
     }
     if backup.exists() {
         fs::remove_dir_all(backup)?;
+    }
+    Ok(())
+}
+
+/// Restores a last-good directory before reading manifests or building if a
+/// previous process died during the two-rename publication window.
+fn recover_published_output_if_missing(output: &Path) -> Result<()> {
+    if output.exists() {
+        return Ok(());
+    }
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Ok(());
+    }
+    let _asset_lock = AssetLock::acquire_exclusive(output).wrap_err_with(|| {
+        format!(
+            "failed to lock asset directory {} for recovery",
+            output.display()
+        )
+    })?;
+    recover_interrupted_publication(output)
+}
+
+/// Restores the newest previous output if a process crashed after moving it
+/// aside but before moving the staged tree into place. The caller holds the
+/// exclusive asset-directory lock throughout recovery and publication.
+fn recover_interrupted_publication(output: &Path) -> Result<()> {
+    if output.exists() {
+        return Ok(());
+    }
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(stem) = output.file_stem().or_else(|| output.file_name()) else {
+        return Ok(());
+    };
+    let prefix = format!("{}.backup-", stem.to_string_lossy());
+    let entries = fs::read_dir(parent)
+        .wrap_err_with(|| {
+            format!(
+                "failed to inspect publication backups in {}",
+                parent.display()
+            )
+        })?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut backups = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with(&prefix) && entry.path().is_dir()
+        })
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    if let Some(backup) = backups.pop() {
+        fs::rename(backup.path(), output).wrap_err_with(|| {
+            format!(
+                "failed to restore last-good assets from {}",
+                backup.path().display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -1326,6 +1701,88 @@ async fn send(
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn lod_settings_change_lod_identity_without_invalidating_asset_cache() {
+        let config = PipelineConfig::new("/data", "/output");
+        let cache_identity = configuration_hash(&config).unwrap();
+        let mut changed = config;
+        changed.lod_origins.insert("Tamriel".to_owned(), [-64, 32]);
+        assert_eq!(configuration_hash(&changed).unwrap(), cache_identity);
+
+        let first = build_identity(&[], &[], &cache_identity, &[]).unwrap();
+        let second = build_identity(
+            &[],
+            &[],
+            &cache_identity,
+            &[serde_json::json!({
+                "worldspace_id": 1,
+                "editor_id": "Tamriel",
+                "status": "ready",
+                "origin": [-64, 32],
+                "extent": null,
+            })],
+        )
+        .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn sidecar_extent_is_half_open_and_uses_negative_world_cells() {
+        let settings = ResolvedLodSettings {
+            origin: LodOrigin::new(-2, 4),
+            extent: Some((2, 3)),
+        };
+        assert!(settings.includes_cell(-2, 4));
+        assert!(settings.includes_cell(-1, 6));
+        assert!(!settings.includes_cell(0, 4));
+        assert!(!settings.includes_cell(-2, 7));
+        assert!(!settings.includes_cell(-3, 4));
+    }
+
+    #[test]
+    fn lod_only_omissions_do_not_mark_full_detail_conversion_incomplete() {
+        let report = PipelineReport {
+            lod_warnings: vec!["worldspace without sidecar".to_owned()],
+            ..Default::default()
+        };
+        assert!(conversion_is_complete(&report));
+    }
+
+    #[test]
+    fn restores_last_good_output_after_interrupted_directory_swap() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("modern_assets");
+        let backup = output.with_extension("backup-12345");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("sentinel"), b"last good").unwrap();
+
+        recover_interrupted_publication(&output).unwrap();
+
+        assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"last good");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn publication_refuses_to_swap_assets_held_by_a_runtime_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("modern_assets");
+        let staging = directory.path().join("staging");
+        fs::create_dir_all(&output).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(output.join("sentinel"), b"last good").unwrap();
+        fs::write(staging.join("sentinel"), b"new build").unwrap();
+        let _reader = AssetLock::acquire_shared(&output).unwrap();
+
+        let error = publish_directory(&staging, &output).unwrap_err();
+
+        assert!(
+            format!("{error:?}").contains("another process holds an incompatible lock"),
+            "unexpected publish error: {error:?}"
+        );
+        assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"last good");
+        assert_eq!(fs::read(staging.join("sentinel")).unwrap(), b"new build");
+    }
 
     #[test]
     fn maps_srgb_runtime_aliases_back_to_their_converted_source() {
@@ -1641,7 +2098,11 @@ mod tests {
             dummy_content::pex::minimal("One").unwrap(),
         )
         .unwrap();
-        // A stale backup makes `publish_directory` refuse to publish.
+        // A stale backup alongside a live output makes `publish_directory`
+        // refuse to publish: without the output dir, a lone backup reads as
+        // an interrupted swap and is restored instead.
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("sentinel"), b"last good").unwrap();
         let backup = output.with_extension(format!("backup-{}", std::process::id()));
         fs::create_dir_all(&backup).unwrap();
 

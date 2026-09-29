@@ -10,6 +10,7 @@ pub enum ProgressStage {
     Textures,
     Meshes,
     Scripts,
+    LodChunks,
     Validating,
     Publishing,
     Complete,

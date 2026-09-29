@@ -14,6 +14,7 @@ pub mod binary;
 pub mod cell_cache;
 pub mod exporter;
 pub mod extractors;
+pub mod lodsettings;
 pub mod mmap_reader;
 pub mod records;
 pub mod types;
